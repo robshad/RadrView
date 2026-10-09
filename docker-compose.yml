@@ -36,7 +36,7 @@ services:
     restart: unless-stopped
     volumes:
       - redis-data:/data
-    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes", "--appendfsync", "everysec", "--loglevel", "warning"]
+    command: ["redis-server", "--save", "3600", "1", "--appendonly", "yes", "--appendfsync", "everysec", "--auto-aof-rewrite-min-size", "4gb", "--loglevel", "warning"]
     networks:
       - internal
 
