@@ -13,8 +13,9 @@ import { loadPalettes, getLUT, isTypedPalette, colorizeTilePng, colorizePrecipTy
 import { createMetricsRouter, recordCacheHit, recordCacheMiss, recordServeDuration } from './metrics.js';
 import { createWindRouter } from './wind.js';
 import { startWindFetcher } from '../wind/fetcher.js';
-import { createNexradTileHandler } from './nexrad-tile.js';
+import { createNexradTileHandler, type NexradTileResult } from './nexrad-tile.js';
 import { readTileWithOverzoom, type TileReader } from './overzoom.js';
+import type { NexradLayer } from '../nexrad/projector.js';
 import { NexradScanProvider } from './nexrad-scan-provider.js';
 import { getAllStations } from '../nexrad/stations.js';
 import { ChunkPoller } from '../nexrad/chunk-poller.js';
@@ -34,7 +35,7 @@ const TRANSPARENT_PNG = Buffer.from(
 export function createApp(
   redis: Redis,
   options?: {
-    nexradTileHandler?: (z: number, x: number, y: number, layer?: string) => Promise<Buffer | null>;
+    nexradTileHandler?: (z: number, x: number, y: number, layer: NexradLayer, requestedTime: number) => Promise<NexradTileResult | null>;
     nexradScanProvider?: NexradScanProvider;
   }
 ): { app: ReturnType<typeof express> } {
@@ -110,6 +111,13 @@ export function createApp(
   app.get('/tile/:timestamp/:z/:x/:y', async (req, res) => {
     const serveStart = Date.now();
     const { timestamp, z, x, y } = req.params;
+    const isoTime = timestamp.replace(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/, '$1-$2-$3T$4:$5:$6Z');
+    const requestedTime = Date.parse(isoTime);
+    if (!/^\d{14}$/.test(timestamp) || !Number.isFinite(requestedTime)
+      || new Date(requestedTime).toISOString().replace(/[-:TZ.]/g, '').slice(0, 14) !== timestamp) {
+      res.status(400).json({ error: 'Invalid timestamp; expected YYYYMMDDHHmmss UTC' });
+      return;
+    }
     const paletteName = (req.query.palette as string) || 'default';
     const source = (req.query.source as string) || 'composite';
 
@@ -119,13 +127,17 @@ export function createApp(
       return;
     }
 
-    const cacheKey = `${paletteName}/${source}/${timestamp}/${z}/${x}/${y}`;
+    const zoomNum = parseInt(z);
+    const nexradLayer = (req.query.layer as string) || 'reflectivity';
+    const useNexrad = !!options?.nexradTileHandler && zoomNum >= config.nexradZoomMin;
+    const cacheKey = `${paletteName}/${source}/${nexradLayer}/${timestamp}/${z}/${x}/${y}`;
 
-    const cached = tileCache.get(cacheKey);
+    const cached = useNexrad ? undefined : tileCache.get(cacheKey);
     if (cached) {
       recordCacheHit();
       res.setHeader('Content-Type', 'image/png');
       res.setHeader('X-Cache', 'hit');
+      res.setHeader('X-Source', source);
       await setCacheHeaders(res, timestamp, redis);
       res.send(cached);
       recordServeDuration(Date.now() - serveStart);
@@ -135,22 +147,22 @@ export function createApp(
     recordCacheMiss();
 
     // NEXRAD Level 2 for high zoom
-    const zoomNum = parseInt(z);
-    const nexradLayer = (req.query.layer as string) || 'reflectivity';
-    if (options?.nexradTileHandler && zoomNum >= config.nexradZoomMin) {
-      const nexradPng = await options.nexradTileHandler(zoomNum, parseInt(x), parseInt(y), nexradLayer as any);
+    if (useNexrad && options?.nexradTileHandler) {
+      const nexradPng = await options.nexradTileHandler(zoomNum, parseInt(x), parseInt(y), nexradLayer as any, requestedTime);
       if (nexradPng) {
         let colorized: Buffer;
         if (isTypedPalette(paletteName)) {
           const defaultLut = getLUT('default');
-          colorized = await colorizeTilePng(nexradPng, defaultLut ?? lut);
+          colorized = await colorizeTilePng(nexradPng.png, defaultLut ?? lut);
         } else {
-          colorized = await colorizeTilePng(nexradPng, lut);
+          colorized = await colorizeTilePng(nexradPng.png, lut);
         }
-        tileCache.set(cacheKey, colorized);
+        // Native tile caching happens after selecting all station observations.
         res.setHeader('Content-Type', 'image/png');
         res.setHeader('X-Cache', 'nexrad');
         res.setHeader('X-Source', 'nexrad-level2');
+        res.setHeader('X-Nexrad-Scans', nexradPng.observations);
+        res.setHeader('X-Radar-Requested-Time', String(requestedTime));
         res.setHeader('Cache-Control', 'public, max-age=30');
         res.send(colorized);
         recordServeDuration(Date.now() - serveStart);
@@ -172,7 +184,8 @@ export function createApp(
 
     if (!grayscalePng) {
       res.setHeader('Content-Type', 'image/png');
-      await setCacheHeaders(res, timestamp, redis);
+      res.setHeader('X-Source', 'unavailable');
+      res.setHeader('Cache-Control', 'no-store');
       res.send(TRANSPARENT_PNG);
       recordServeDuration(Date.now() - serveStart);
       return;
@@ -201,6 +214,7 @@ export function createApp(
 
     res.setHeader('Content-Type', 'image/png');
     res.setHeader('X-Cache', 'miss');
+    res.setHeader('X-Source', source);
     await setCacheHeaders(res, timestamp, redis);
     res.send(colorized);
     recordServeDuration(Date.now() - serveStart);
@@ -231,7 +245,7 @@ if (isMainModule) {
   const subscriber = new Redis(config.redisUrl);
 
   // NEXRAD Level 2 — reads pre-computed scans from Redis (ingester runs as separate container)
-  let nexradTileHandler: ((z: number, x: number, y: number) => Promise<Buffer | null>) | undefined;
+  let nexradTileHandler: ReturnType<typeof createNexradTileHandler> | undefined;
   let nexradScanProvider: NexradScanProvider | undefined;
   let nexradWsHandler: NexradWebSocketHandler | undefined;
   if (config.nexradEnabled) {

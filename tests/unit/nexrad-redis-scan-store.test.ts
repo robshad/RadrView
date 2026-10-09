@@ -1,9 +1,11 @@
+import request from 'supertest';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock ioredis
 vi.mock('ioredis', () => {
   const storage = new Map<string, Record<string, string>>();
   const sets = new Map<string, Set<string>>();
+  const sortedSets = new Map<string, Map<string, number>>();
   const expiry = new Map<string, number>();
 
   const mockRedis = {
@@ -23,12 +25,38 @@ vi.mock('ioredis', () => {
     smembers: vi.fn(async (key: string) => {
       return [...(sets.get(key) || [])];
     }),
+    pexpireat: vi.fn(async (key: string, time: number) => { expiry.set(key, time); }),
+    zadd: vi.fn(async (key: string, score: number, value: string) => {
+      if (!sortedSets.has(key)) sortedSets.set(key, new Map());
+      sortedSets.get(key)!.set(value, score);
+    }),
+    zremrangebyscore: vi.fn(async (key: string, _min: string, max: number) => {
+      for (const [member, score] of sortedSets.get(key) || []) {
+        if (score <= max) sortedSets.get(key)!.delete(member);
+      }
+    }),
+    zrevrangebyscore: vi.fn(async (key: string, max: number, min: number) => {
+      return [...(sortedSets.get(key) || [])].filter(([, score]) => score <= max && score >= min)
+        .sort((a, b) => b[1] - a[1]).slice(0, 1).map(([member]) => member);
+    }),
+    multi: vi.fn(() => {
+      const commands: Array<() => Promise<unknown>> = [];
+      const transaction: any = { exec: async () => Promise.all(commands.map(async fn => [null, await fn()])) };
+      for (const name of ['hset', 'expire', 'pexpireat', 'zadd', 'zremrangebyscore', 'sadd'] as const) {
+        transaction[name] = (...args: any[]) => {
+          commands.push(() => (mockRedis[name] as any)(...args));
+          return transaction;
+        };
+      }
+      return transaction;
+    }),
     // Expose internals for test verification
     _storage: storage,
     _sets: sets,
     _expiry: expiry,
     _clear: () => {
       storage.clear();
+      sortedSets.clear();
       sets.clear();
       expiry.clear();
     },
@@ -332,5 +360,94 @@ describe('nexrad/redis-scan-store', () => {
       expect(statuses).toHaveLength(1);
       expect(statuses[0].status).toBe('unavailable');
     });
+  });
+});
+
+
+describe('historical selection', () => {
+  it('selects newest scan at or before time; excludes future, stale, and missing observations', async () => {
+    const redis = new Redis() as any;
+    redis._clear();
+    const now = Date.now();
+    const earlier = now - 8 * 60_000;
+    await writeScanToRedis(redis, createMockPreparedScan({ timestamp: earlier }));
+    await writeScanToRedis(redis, createMockPreparedScan({ timestamp: now - 2 * 60_000 }));
+    expect((await readScanFromRedis(redis, 'KTLX', now - 4 * 60_000))?.timestamp).toBe(earlier);
+    expect((await readScanFromRedis(redis, 'KTLX', now))?.timestamp).toBe(now - 2 * 60_000);
+    expect(await readScanFromRedis(redis, 'KTLX', earlier - 1)).toBeNull();
+    expect(await readScanFromRedis(redis, 'KTLX', now + 8 * 60_000 + 1)).toBeNull();
+    expect(await readScanFromRedis(redis, 'MISSING', now)).toBeNull();
+    expect(await readScanFromRedis(redis, 'KTLX', Date.UTC(2000, 0, 1))).toBeNull();
+  });
+
+  it('retains two hours by observation time and prunes the history index', async () => {
+    const redis = new Redis() as any;
+    redis._clear();
+    const now = Date.now();
+    const old = now - 2 * 60 * 60_000 - 100;
+    await writeScanToRedis(redis, createMockPreparedScan({ timestamp: old }));
+    await writeScanToRedis(redis, createMockPreparedScan({ timestamp: now }));
+    expect(redis.pexpireat).toHaveBeenCalledWith(`nexrad:history:KTLX:${now}`, now + 2 * 60 * 60_000);
+    expect(await readScanFromRedis(redis, 'KTLX', old)).toBeNull();
+  });
+});
+
+
+// Exercise the HTTP -> provider -> historical store -> real projector path.
+// These are synthetic radar observations; live real-data checks remain required.
+vi.mock('../../src/storage/index.js', () => ({ getTileStore: () => ({ readTile: async () => null }) }));
+vi.mock('../../src/wind/fetcher.js', () => ({ getWindGrid: () => null, startWindFetcher: async () => {} }));
+import { createApp } from '../../src/server/index.js';
+import { createNexradTileHandler } from '../../src/server/nexrad-tile.js';
+import { NexradScanProvider } from '../../src/server/nexrad-scan-provider.js';
+import { projectScan } from '../../src/nexrad/projector.js';
+import { getAllStations } from '../../src/nexrad/stations.js';
+
+function observation(timestamp: number, dbz: number): PreparedScan {
+  const station = getAllStations().find(s => s.id === 'KTLX')!;
+  return projectScan(station, {
+    stationId: station.id, timestamp, elevation: 0.5, vcp: 212,
+    radials: Array.from({ length: 360 }, (_, azimuth) => ({
+      azimuth, elevation: 0.5, firstGateRange: 0, gateSpacing: 1000,
+      values: new Float32Array(300).fill(dbz),
+      bioValues: new Float32Array(300).fill(NaN), velocity: null,
+    })),
+  });
+}
+
+function frameTime(ms: number): string {
+  return new Date(ms).toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
+}
+
+describe('historical tiles through HTTP', () => {
+  it('renders distinct observations and reports unavailable for missing/stale/future-only history', async () => {
+    const redis = new Redis() as any;
+    redis._clear();
+    const now = Math.floor(Date.now() / 1000) * 1000;
+    const earlier = now - 5 * 60_000;
+    await writeScanToRedis(redis, observation(earlier, 20));
+    await writeScanToRedis(redis, observation(now, 50));
+    const provider = new NexradScanProvider(redis);
+    const { app } = createApp(redis, { nexradTileHandler: createNexradTileHandler(provider) });
+    const tile = (time: number, layer = 'reflectivity') => request(app).get(
+      `/tile/${frameTime(time)}/9/117/202?source=mrms&layer=${layer}`,
+    );
+    const old = await tile(earlier);
+    const current = await tile(now);
+    expect(old.status).toBe(200);
+    expect(old.headers['x-source']).toBe('nexrad-level2');
+    expect(old.headers['x-nexrad-scans']).toBe(`KTLX:${earlier}`);
+    expect(current.headers['x-nexrad-scans']).toBe(`KTLX:${now}`);
+    expect(Buffer.compare(old.body, current.body)).not.toBe(0);
+    expect((await tile(earlier)).body).toEqual(old.body);
+    for (const time of [Date.UTC(2000, 0, 1), earlier - 1000, now + 10 * 60_000 + 1000]) {
+      const unavailable = await tile(time);
+      expect(unavailable.headers['x-source']).toBe('unavailable');
+      expect(unavailable.headers['cache-control']).toBe('no-store');
+    }
+    // Reflectivity cache must not hide a biological-layer request.
+    expect((await tile(earlier, 'biological')).headers['x-source']).toBe('unavailable');
+    expect((await request(app).get('/tile/20260230000000/9/117/202')).status).toBe(400);
+    provider.close();
   });
 });

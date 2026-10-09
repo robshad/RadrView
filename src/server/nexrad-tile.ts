@@ -11,10 +11,15 @@ const emptyTiles = new LRUCache<string, true>({ max: 10000 });
 const R = 6378137;
 const RAD = 180 / Math.PI;
 
+export interface NexradTileResult {
+  png: Buffer;
+  observations: string;
+}
+
 export function createNexradTileHandler(provider: NexradScanProvider) {
   return async function handleNexradTile(
-    z: number, x: number, y: number, layer: NexradLayer = 'reflectivity'
-  ): Promise<Buffer | null> {
+    z: number, x: number, y: number, layer: NexradLayer, requestedTime: number
+  ): Promise<NexradTileResult | null> {
     const bounds = tileToMercatorBounds(z, x, y);
     const west = (bounds.west / R) * RAD;
     const east = (bounds.east / R) * RAD;
@@ -22,14 +27,14 @@ export function createNexradTileHandler(provider: NexradScanProvider) {
     const north = Math.atan(Math.exp(bounds.north / R)) * 2 * RAD - 90;
 
     // Get scans from Redis-backed provider (cached in memory)
-    const scans = await provider.getScansForBounds(west, south, east, north);
+    const scans = await provider.getScansForBounds(west, south, east, north, requestedTime);
     if (scans.length === 0) return null;
 
     // Check tile cache (include layer in cache key)
-    const latestTs = Math.max(...scans.map(s => s.timestamp));
-    const cacheKey = `${layer}/${z}/${x}/${y}/${latestTs}`;
+    const observations = scans.map(s => `${s.stationId}:${s.timestamp}`).sort().join(',');
+    const cacheKey = `${layer}/${z}/${x}/${y}/${observations}`;
     const cached = tileCache.get(cacheKey);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) return { png: cached, observations };
     if (emptyTiles.has(cacheKey)) return null;
 
     // Render
@@ -47,6 +52,6 @@ export function createNexradTileHandler(provider: NexradScanProvider) {
       .toBuffer();
 
     tileCache.set(cacheKey, png);
-    return png;
+    return { png, observations };
   };
 }

@@ -4,7 +4,9 @@
  * The NEXRAD ingester (separate process) writes PreparedScans to Redis.
  * The server reads them on demand for tile rendering.
  *
- * Storage format: each station's scan is stored as a Redis hash with:
+ * Storage format: immutable station/timestamp hashes indexed by per-station
+ * sorted sets retain two hours; a latest-scan hash is kept for compatibility.
+ * Each scan hash contains:
  * - Scalar fields as strings (stationId, timestamp, coordinates, etc.)
  * - azimuthsRad as a base64-encoded Float32Array buffer
  * - gatePixels as a base64-encoded concatenated buffer (all radials packed sequentially)
@@ -20,6 +22,9 @@ const logger = createLogger('redis-scan-store');
 const SCAN_KEY_PREFIX = 'nexrad:scan:';
 const STATUS_KEY_PREFIX = 'nexrad:status:';
 const STATIONS_KEY = 'nexrad:active-stations';
+export const HISTORY_RETENTION_MS = 2 * 60 * 60 * 1000;
+export const MAX_SCAN_AGE_MS = 10 * 60 * 1000;
+const HISTORY_PREFIX = 'nexrad:history:';
 const SCAN_TTL = 1800;  // 30 minutes (scans update every ~7 min, TTL covers gaps)
 
 export interface RedisStationStatus {
@@ -45,7 +50,7 @@ export async function writeScanToRedis(redis: Redis, scan: PreparedScan): Promis
     return buf.toString('base64');
   }
 
-  await redis.hset(key, {
+  const data = {
     stationId: scan.stationId,
     timestamp: String(scan.timestamp),
     stationMx: String(scan.stationMx),
@@ -70,11 +75,19 @@ export async function writeScanToRedis(redis: Redis, scan: PreparedScan): Promis
     gatePixels: packGates(scan.gatePixels, scan.gateCount),
     bioGatePixels: packGates(scan.bioGatePixels, scan.gateCount),
     velGatePixels: packGates(scan.velGatePixels, scan.velGateCount || 1),
-  });
-  await redis.expire(key, SCAN_TTL);
-
-  // Track this station as active
-  await redis.sadd(STATIONS_KEY, scan.stationId);
+  };
+  // Publish payload and index together; retention follows observation time, not
+  // ingestion time. Refreshing latest/status must never extend historical TTLs.
+  const historyKey = `${HISTORY_PREFIX}${scan.stationId}:${scan.timestamp}`;
+  const indexKey = `${HISTORY_PREFIX}${scan.stationId}`;
+  const result = await redis.multi()
+    .hset(key, data).expire(key, SCAN_TTL)
+    .hset(historyKey, data).pexpireat(historyKey, scan.timestamp + HISTORY_RETENTION_MS)
+    .zadd(indexKey, scan.timestamp, String(scan.timestamp))
+    .zremrangebyscore(indexKey, '-inf', Date.now() - HISTORY_RETENTION_MS)
+    .expire(indexKey, HISTORY_RETENTION_MS / 1000)
+    .sadd(STATIONS_KEY, scan.stationId).exec();
+  if (!result || result.some(([err]) => err)) throw new Error('Failed to persist NEXRAD scan');
 }
 
 /** Write station status to Redis */
@@ -97,11 +110,32 @@ export async function refreshScanTTL(redis: Redis, stationId: string): Promise<b
   return scanAlive === 1;
 }
 
+/** Select newest retained observation at or before the requested UTC time. */
+export async function selectScanTimestamp(redis: Redis, stationId: string, requestedTime: number): Promise<number | null> {
+  if (!Number.isFinite(requestedTime)) return null;
+  const timestamps = await redis.zrevrangebyscore(
+    HISTORY_PREFIX + stationId, requestedTime,
+    Math.max(requestedTime - MAX_SCAN_AGE_MS, Date.now() - HISTORY_RETENTION_MS),
+    'LIMIT', 0, 1,
+  );
+  return timestamps.length ? Number(timestamps[0]) : null;
+}
+
 /** Read a PreparedScan from Redis (called by the server process) */
-export async function readScanFromRedis(redis: Redis, stationId: string): Promise<PreparedScan | null> {
-  const key = SCAN_KEY_PREFIX + stationId;
+export async function readScanFromRedis(redis: Redis, stationId: string, requestedTime?: number): Promise<PreparedScan | null> {
+  let key = SCAN_KEY_PREFIX + stationId;
+  if (requestedTime !== undefined) {
+    if (!Number.isFinite(requestedTime)) return null;
+    const selected = await selectScanTimestamp(redis, stationId, requestedTime);
+    if (selected === null) return null;
+    key = `${HISTORY_PREFIX}${stationId}:${selected}`;
+  }
   const data = await redis.hgetall(key);
   if (!data.stationId) return null;
+  const observationTime = Number(data.timestamp);
+  if (requestedTime !== undefined && (!Number.isFinite(observationTime)
+    || observationTime > requestedTime || requestedTime - observationTime > MAX_SCAN_AGE_MS
+    || observationTime <= Date.now() - HISTORY_RETENTION_MS)) return null;
 
   const gateCount = parseInt(data.gateCount);
   const count = parseInt(data.count);  // number of radials

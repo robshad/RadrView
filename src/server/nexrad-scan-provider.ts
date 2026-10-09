@@ -9,46 +9,27 @@
 import { Redis } from 'ioredis';
 import { LRUCache } from 'lru-cache';
 import type { PreparedScan } from '../nexrad/projector.js';
-import { readScanFromRedis, getActiveStationIds, readAllStatuses, type RedisStationStatus } from '../nexrad/redis-scan-store.js';
+import { readScanFromRedis, selectScanTimestamp, readAllStatuses, type RedisStationStatus } from '../nexrad/redis-scan-store.js';
 import { findStationsForBounds, getAllStations } from '../nexrad/stations.js';
-import { createLogger } from '../utils/logger.js';
-
-const logger = createLogger('scan-provider');
 
 export class NexradScanProvider {
   private redis: Redis;
   private scanCache = new LRUCache<string, PreparedScan>({ max: 200, ttl: 60_000 });
-  private missCache = new LRUCache<string, true>({ max: 200, ttl: 5_000 });
-  private activeStations: Set<string> = new Set();
-  private refreshTimer: NodeJS.Timeout | null = null;
-
   constructor(redis: Redis) {
     this.redis = redis;
-    // Refresh active station list every 30 seconds
-    this.refreshActiveStations();
-    this.refreshTimer = setInterval(() => this.refreshActiveStations(), 30_000);
-  }
-
-  private async refreshActiveStations(): Promise<void> {
-    try {
-      const ids = await getActiveStationIds(this.redis);
-      this.activeStations = new Set(ids);
-    } catch {}
   }
 
   /** Get a PreparedScan for a station (from cache or Redis) */
-  async getScan(stationId: string): Promise<PreparedScan | null> {
-    const cached = this.scanCache.get(stationId);
-    if (cached) return cached;
-    if (this.missCache.has(stationId)) return null;
-
+  async getScan(stationId: string, requestedTime: number): Promise<PreparedScan | null> {
     try {
-      const scan = await readScanFromRedis(this.redis, stationId);
-      if (scan) {
-        this.scanCache.set(stationId, scan);
-      } else {
-        this.missCache.set(stationId, true);
-      }
+      // Re-select on every request: later ingestion may fill a historical gap.
+      const selected = await selectScanTimestamp(this.redis, stationId, requestedTime);
+      if (selected === null) return null;
+      const cacheKey = `${stationId}:${selected}`;
+      const cached = this.scanCache.get(cacheKey);
+      if (cached) return cached;
+      const scan = await readScanFromRedis(this.redis, stationId, selected);
+      if (scan) this.scanCache.set(cacheKey, scan);
       return scan;
     } catch {
       return null;
@@ -56,13 +37,12 @@ export class NexradScanProvider {
   }
 
   /** Get PreparedScans for all stations covering a tile's bounds */
-  async getScansForBounds(west: number, south: number, east: number, north: number): Promise<PreparedScan[]> {
+  async getScansForBounds(west: number, south: number, east: number, north: number, requestedTime: number): Promise<PreparedScan[]> {
     const stations = findStationsForBounds(west, south, east, north);
     const scans: PreparedScan[] = [];
 
     for (const station of stations) {
-      if (!this.activeStations.has(station.id)) continue;
-      const scan = await this.getScan(station.id);
+      const scan = await this.getScan(station.id, requestedTime);
       if (scan) scans.push(scan);
     }
 
@@ -76,6 +56,6 @@ export class NexradScanProvider {
   }
 
   close(): void {
-    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.scanCache.clear();
   }
 }
